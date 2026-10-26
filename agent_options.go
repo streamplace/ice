@@ -607,14 +607,19 @@ func WithUDPMux(udpMux UDPMux) AgentOption {
 	}
 }
 
-// WithUDPMuxSrflx sets the UDP mux for server reflexive candidates.
-func WithUDPMuxSrflx(udpMuxSrflx UniversalUDPMux) AgentOption {
+// WithUDPMuxSrflx sets the UDP muxes for server reflexive candidates.
+func WithUDPMuxSrflx(udpMuxSrflx ...UniversalUDPMux) AgentOption {
 	return func(a *Agent) error {
 		if a.constructed {
 			return ErrAgentOptionNotUpdatable
 		}
 
-		a.udpMuxSrflx = udpMuxSrflx
+		a.udpMuxSrflx = nil
+		for _, mux := range udpMuxSrflx {
+			if mux != nil {
+				a.udpMuxSrflx = append(a.udpMuxSrflx, mux)
+			}
+		}
 
 		return nil
 	}

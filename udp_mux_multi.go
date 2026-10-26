@@ -81,7 +81,8 @@ func (m *MultiUDPMuxDefault) GetListenAddresses() []net.Addr {
 // listen all interfaces on the provided port.
 func NewMultiUDPMuxFromPort(port int, opts ...UDPMuxFromPortOption) (*MultiUDPMuxDefault, error) { //nolint:cyclop
 	params := multiUDPMuxFromPortParam{
-		networks: []NetworkType{NetworkTypeUDP4, NetworkTypeUDP6},
+		networks:   []NetworkType{NetworkTypeUDP4, NetworkTypeUDP6},
+		muxFactory: func(params UDPMuxParams) UDPMux { return NewUDPMuxDefault(params) },
 	}
 	for _, opt := range opts {
 		opt.apply(&params)
@@ -118,6 +119,15 @@ func NewMultiUDPMuxFromPort(port int, opts ...UDPMuxFromPortOption) (*MultiUDPMu
 			_ = conn.SetWriteBuffer(params.writeBufferSize)
 		}
 		conns = append(conns, conn)
+		if port == 0 {
+			localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+			if !ok {
+				err = errInvalidAddress
+
+				break
+			}
+			port = localAddr.Port
+		}
 	}
 
 	if err != nil {
@@ -130,7 +140,7 @@ func NewMultiUDPMuxFromPort(port int, opts ...UDPMuxFromPortOption) (*MultiUDPMu
 
 	muxes := make([]UDPMux, 0, len(conns))
 	for _, conn := range conns {
-		mux := NewUDPMuxDefault(UDPMuxParams{
+		mux := params.muxFactory(UDPMuxParams{
 			Logger:  params.logger,
 			UDPConn: conn,
 			Net:     params.net,
@@ -155,10 +165,20 @@ type multiUDPMuxFromPortParam struct {
 	logger          logging.LeveledLogger
 	includeLoopback bool
 	net             transport.Net
+	muxFactory      func(UDPMuxParams) UDPMux
 }
 
 type udpMuxFromPortOption struct {
 	f func(*multiUDPMuxFromPortParam)
+}
+
+// UDPMuxFromPortWithMuxFactory sets the constructor used for each bound address.
+func UDPMuxFromPortWithMuxFactory(factory func(UDPMuxParams) UDPMux) UDPMuxFromPortOption {
+	return &udpMuxFromPortOption{
+		f: func(p *multiUDPMuxFromPortParam) {
+			p.muxFactory = factory
+		},
+	}
 }
 
 func (o *udpMuxFromPortOption) apply(p *multiUDPMuxFromPortParam) {

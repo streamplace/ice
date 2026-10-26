@@ -8,14 +8,17 @@ package ice
 import (
 	"errors"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/pion/logging"
+	"github.com/pion/stun/v4"
 	"github.com/pion/transport/v5"
 	"github.com/pion/transport/v5/stdnet"
 	"github.com/pion/transport/v5/test"
+	"github.com/pion/turn/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -386,4 +389,68 @@ func TestNewMultiUDPMuxFromPort_CleanupClosesAll(t *testing.T) {
 	rebind, err := stdNet.ListenUDP("udp", &net.UDPAddr{IP: first.AsSlice(), Port: picked, Zone: first.Zone()})
 	require.NoError(t, err, "expected first address/port to be free after cleanup")
 	_ = rebind.Close()
+}
+
+func TestGatherCandidatesSrflxUDPMuxMultipleAddresses(t *testing.T) {
+	stunConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	server, err := turn.NewServer(turn.ServerConfig{
+		PacketConnConfigs: []turn.PacketConnConfig{{PacketConn: stunConn}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, server.Close()) })
+
+	var muxes []UniversalUDPMux
+	multi, err := NewMultiUDPMuxFromPort(0,
+		UDPMuxFromPortWithNetworks(NetworkTypeUDP4), UDPMuxFromPortWithLoopback(),
+		UDPMuxFromPortWithMuxFactory(func(params UDPMuxParams) UDPMux {
+			mux := NewUniversalUDPMuxDefault(UniversalUDPMuxParams{UDPConn: params.UDPConn})
+			muxes = append(muxes, mux)
+
+			return mux
+		}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, multi.Close()) })
+	addresses := multi.GetListenAddresses()
+	require.GreaterOrEqual(t, len(addresses), 2, "test needs loopback and another IPv4 address")
+	firstAddr, ok := addresses[0].(*net.UDPAddr)
+	require.True(t, ok)
+	port := firstAddr.Port
+	var expected []string
+	for _, address := range addresses {
+		expected = append(expected, address.String())
+	}
+	stunAddr, ok := stunConn.LocalAddr().(*net.UDPAddr)
+	require.True(t, ok)
+	agent, err := NewAgentWithOptions(
+		WithNetworkTypes([]NetworkType{NetworkTypeUDP4}),
+		WithCandidateTypes([]CandidateType{CandidateTypeServerReflexive}),
+		WithUrls([]*stun.URI{{Scheme: SchemeTypeSTUN, Host: "127.0.0.1", Port: stunAddr.Port}}),
+		WithUDPMuxSrflx(muxes...),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, agent.Close()) })
+	done := make(chan struct{})
+	require.NoError(t, agent.OnCandidate(func(candidate Candidate) {
+		if candidate == nil {
+			close(done)
+		}
+	}))
+	require.NoError(t, agent.GatherCandidates())
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "STUN gathering did not complete")
+	}
+	candidates, err := agent.GetLocalCandidates()
+	require.NoError(t, err)
+	var actual []string
+	for _, candidate := range candidates {
+		require.Equal(t, CandidateTypeServerReflexive, candidate.Type())
+		require.Equal(t, candidate.Address(), candidate.RelatedAddress().Address)
+		require.Equal(t, port, candidate.RelatedAddress().Port)
+		actual = append(actual, net.JoinHostPort(candidate.Address(), strconv.Itoa(candidate.Port())))
+	}
+	require.ElementsMatch(t, expected, actual, "each local socket must gather its own STUN mapping on the shared port")
 }

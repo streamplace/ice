@@ -159,7 +159,7 @@ type Agent struct {
 	net         transport.Net
 	tcpMux      TCPMux
 	udpMux      UDPMux
-	udpMuxSrflx UniversalUDPMux
+	udpMuxSrflx []UniversalUDPMux
 
 	interfaceFilter func(string) (keep bool)
 	ipFilter        func(net.IP) (keep bool)
@@ -358,7 +358,6 @@ func createAgentBase(config *AgentConfig) (*Agent, error) {
 		proxyDialer:                     config.ProxyDialer,
 		tcpMux:                          config.TCPMux,
 		udpMux:                          config.UDPMux,
-		udpMuxSrflx:                     config.UDPMuxSrflx,
 		mDNSMode:                        mDNSMode,
 		mDNSName:                        mDNSName,
 		gatherCandidateCancel:           func() {},
@@ -382,6 +381,9 @@ func createAgentBase(config *AgentConfig) (*Agent, error) {
 		turnClientFactory:               defaultTurnClient,
 	}
 
+	if config.UDPMuxSrflx != nil {
+		agent.udpMuxSrflx = []UniversalUDPMux{config.UDPMuxSrflx}
+	}
 	config.initWithDefaults(agent)
 
 	return agent, nil
@@ -1576,8 +1578,8 @@ func (a *Agent) removeUfragFromMux() {
 	if a.udpMux != nil {
 		a.udpMux.RemoveConnByUfrag(a.localUfrag)
 	}
-	if a.udpMuxSrflx != nil {
-		a.udpMuxSrflx.RemoveConnByUfrag(a.localUfrag)
+	for _, mux := range a.udpMuxSrflx {
+		mux.RemoveConnByUfrag(a.localUfrag)
 	}
 }
 

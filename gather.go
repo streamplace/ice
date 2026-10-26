@@ -327,7 +327,7 @@ func (a *Agent) gatherServerReflexiveCandidates(
 	if !replaceSrflx {
 		wg.Add(1)
 		go func() {
-			if a.udpMuxSrflx != nil {
+			if len(a.udpMuxSrflx) > 0 {
 				a.gatherCandidatesSrflxUDPMux(ctx, a.urls, a.networkTypes, generation, localUfrag)
 			} else {
 				a.gatherCandidatesSrflx(ctx, a.urls, a.networkTypes, generation)
@@ -777,69 +777,74 @@ func (a *Agent) gatherCandidatesSrflxUDPMux(
 				continue
 			}
 
-			for _, listenAddr := range a.udpMuxSrflx.GetListenAddresses() {
-				udpAddr, ok := listenAddr.(*net.UDPAddr)
-				if !ok {
-					a.log.Warn("Failed to cast udpMuxSrflx listen address to UDPAddr")
+			for _, mux := range a.udpMuxSrflx {
+				for _, listenAddr := range mux.GetListenAddresses() {
+					udpAddr, ok := listenAddr.(*net.UDPAddr)
+					if !ok {
+						a.log.Warn("Failed to cast udpMuxSrflx listen address to UDPAddr")
 
-					continue
+						continue
+					}
+					if networkType.IsIPv4() != (udpAddr.IP.To4() != nil) {
+						continue
+					}
+					wg.Add(1)
+					go func(url stun.URI, network string, localAddr *net.UDPAddr) {
+						defer wg.Done()
+
+						hostPort := net.JoinHostPort(url.Host, strconv.Itoa(url.Port))
+						serverAddr, err := a.net.ResolveUDPAddr(network, hostPort)
+						if err != nil {
+							a.log.Debugf("Failed to resolve STUN host: %s %s: %v", network, hostPort, err)
+
+							return
+						}
+
+						if shouldFilterLocationTracked(serverAddr.IP) {
+							a.log.Warnf("STUN host %s is somehow filtered for location tracking reasons", hostPort)
+
+							return
+						}
+
+						xorAddr, err := getXORMappedAddr(ctx, mux, serverAddr, a.stunGatherTimeout)
+						if err != nil {
+							a.log.Warnf("Failed get server reflexive address %s %s: %v", network, url, err)
+
+							return
+						}
+
+						conn, err := mux.GetConnForURL(localUfrag, url.String(), localAddr)
+						if err != nil {
+							a.log.Warnf("Failed to find connection in UDPMuxSrflx %s %s: %v", network, url, err)
+
+							return
+						}
+
+						ip := xorAddr.IP
+						port := xorAddr.Port
+
+						srflxConfig := CandidateServerReflexiveConfig{
+							Network:   network,
+							Address:   ip.String(),
+							Port:      port,
+							Component: ComponentRTP,
+							RelAddr:   localAddr.IP.String(),
+							RelPort:   localAddr.Port,
+						}
+						cand, err := NewCandidateServerReflexive(&srflxConfig)
+						if err != nil {
+							closeConnAndLog(conn, a.log, "failed to create server reflexive candidate: %s %s %d: %v", network, ip, port, err)
+
+							return
+						}
+						a.rewriteCandidatePort(&cand.candidateBase, localAddr.IP.String(), "")
+
+						if err := a.addCandidate(ctx, cand, conn, &generation, false); err != nil {
+							a.log.Warnf("Failed to append srflx mux candidate to localCandidates: %v", err)
+							a.cleanupCandidate(cand, conn, "failed")
+						}
+					}(*urls[i], networkType.String(), udpAddr)
 				}
-				wg.Add(1)
-				go func(url stun.URI, network string, localAddr *net.UDPAddr) {
-					defer wg.Done()
-
-					hostPort := net.JoinHostPort(url.Host, strconv.Itoa(url.Port))
-					serverAddr, err := a.net.ResolveUDPAddr(network, hostPort)
-					if err != nil {
-						a.log.Debugf("Failed to resolve STUN host: %s %s: %v", network, hostPort, err)
-
-						return
-					}
-
-					if shouldFilterLocationTracked(serverAddr.IP) {
-						a.log.Warnf("STUN host %s is somehow filtered for location tracking reasons", hostPort)
-
-						return
-					}
-
-					xorAddr, err := getXORMappedAddr(ctx, a.udpMuxSrflx, serverAddr, a.stunGatherTimeout)
-					if err != nil {
-						a.log.Warnf("Failed get server reflexive address %s %s: %v", network, url, err)
-
-						return
-					}
-
-					conn, err := a.udpMuxSrflx.GetConnForURL(localUfrag, url.String(), localAddr)
-					if err != nil {
-						a.log.Warnf("Failed to find connection in UDPMuxSrflx %s %s: %v", network, url, err)
-
-						return
-					}
-
-					ip := xorAddr.IP
-					port := xorAddr.Port
-
-					srflxConfig := CandidateServerReflexiveConfig{
-						Network:   network,
-						Address:   ip.String(),
-						Port:      port,
-						Component: ComponentRTP,
-						RelAddr:   localAddr.IP.String(),
-						RelPort:   localAddr.Port,
-					}
-					cand, err := NewCandidateServerReflexive(&srflxConfig)
-					if err != nil {
-						closeConnAndLog(conn, a.log, "failed to create server reflexive candidate: %s %s %d: %v", network, ip, port, err)
-
-						return
-					}
-					a.rewriteCandidatePort(&cand.candidateBase, localAddr.IP.String(), "")
-
-					if err := a.addCandidate(ctx, cand, conn, &generation, false); err != nil {
-						a.log.Warnf("Failed to append srflx mux candidate to localCandidates: %v", err)
-						a.cleanupCandidate(cand, conn, "failed")
-					}
-				}(*urls[i], networkType.String(), udpAddr)
 			}
 		}
 	}

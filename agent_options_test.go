@@ -455,7 +455,7 @@ func TestWithMuxOptions(t *testing.T) {
 
 	assert.Equal(t, tcpMux, agent.tcpMux)
 	assert.Equal(t, udpMux, agent.udpMux)
-	assert.Equal(t, udpMuxSrflx, agent.udpMuxSrflx)
+	assert.Equal(t, []UniversalUDPMux{udpMuxSrflx}, agent.udpMuxSrflx)
 }
 
 func TestWithProxyDialer(t *testing.T) {
