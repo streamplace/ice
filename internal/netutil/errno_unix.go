@@ -11,6 +11,11 @@ import (
 	"syscall"
 )
 
+// IsAddrInUse reports whether err indicates that a local port is already bound.
+func IsAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
+}
+
 // IsAddrUnavailable reports whether err indicates that the address
 // is unavailable (as opposed to a specific port being busy).
 func IsAddrUnavailable(err error) bool {

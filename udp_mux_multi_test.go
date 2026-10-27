@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/ice/v4/internal/netutil"
 	"github.com/pion/logging"
 	"github.com/pion/stun/v4"
 	"github.com/pion/transport/v5"
@@ -453,4 +454,90 @@ func TestGatherCandidatesSrflxUDPMuxMultipleAddresses(t *testing.T) {
 		actual = append(actual, net.JoinHostPort(candidate.Address(), strconv.Itoa(candidate.Port())))
 	}
 	require.ElementsMatch(t, expected, actual, "each local socket must gather its own STUN mapping on the shared port")
+}
+
+// portChoiceNet controls ephemeral selection while retaining real UDP binds.
+type portChoiceNet struct {
+	transport.Net
+	ports             []int
+	calls             int
+	unavailableSecond bool
+}
+
+func (n *portChoiceNet) ListenUDP(network string, addr *net.UDPAddr) (transport.UDPConn, error) {
+	n.calls++
+	local := *addr
+	if local.Port == 0 && len(n.ports) > 0 {
+		local.Port, n.ports = n.ports[0], n.ports[1:]
+	}
+	if n.unavailableSecond && n.calls == 2 {
+		local.IP = net.IPv4(192, 0, 2, 1)
+	}
+
+	return n.Net.ListenUDP(network, &local)
+}
+
+func TestNewMultiUDPMuxFromPort_EphemeralCollision(t *testing.T) {
+	for _, tt := range []struct {
+		name              string
+		collisions        int
+		explicit          bool
+		unavailableSecond bool
+		wantError         bool
+		wantCalls         int
+	}{
+		{name: "recovers", collisions: 1},
+		{name: "retry limit", collisions: 32, wantError: true, wantCalls: 32},
+		{name: "explicit port", explicit: true, wantError: true, wantCalls: 2},
+		{name: "unavailable address", collisions: 1, unavailableSecond: true, wantError: true, wantCalls: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stdNet, err := stdnet.NewNet()
+			require.NoError(t, err)
+			_, addrs, err := localInterfaces(stdNet, nil, nil, []NetworkType{NetworkTypeUDP4}, true)
+			require.NoError(t, err)
+			require.GreaterOrEqual(t, len(addrs), 2, "test needs two local IPv4 addresses")
+			held, err := stdNet.ListenUDP("udp4", &net.UDPAddr{IP: addrs[1].addr.AsSlice()})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, held.Close()) })
+			occupied, ok := held.LocalAddr().(*net.UDPAddr)
+			require.True(t, ok)
+			network := &portChoiceNet{Net: stdNet, unavailableSecond: tt.unavailableSecond}
+			for range tt.collisions {
+				network.ports = append(network.ports, occupied.Port)
+			}
+			port := 0
+			if tt.explicit {
+				port = occupied.Port
+			}
+			mux, err := NewMultiUDPMuxFromPort(port, UDPMuxFromPortWithNet(network),
+				UDPMuxFromPortWithNetworks(NetworkTypeUDP4), UDPMuxFromPortWithLoopback())
+			if mux != nil {
+				t.Cleanup(func() { require.NoError(t, mux.Close()) })
+			}
+			if tt.wantError {
+				require.Error(t, err)
+				require.Nil(t, mux)
+				require.Equal(t, tt.wantCalls, network.calls, "retry only ephemeral collisions, with a fixed bound")
+				require.Equal(t, tt.unavailableSecond, netutil.IsAddrUnavailable(err))
+			} else {
+				require.NoError(t, err)
+				addresses := mux.GetListenAddresses()
+				require.Len(t, addresses, len(addrs))
+				first, ok := addresses[0].(*net.UDPAddr)
+				require.True(t, ok)
+				require.NotEqual(t, occupied.Port, first.Port)
+				for _, address := range addresses {
+					local, ok := address.(*net.UDPAddr)
+					require.True(t, ok)
+					require.Equal(t, first.Port, local.Port, "all local addresses must share one port")
+				}
+			}
+
+			// Every failed attempt must release the first address's socket.
+			probe, err := stdNet.ListenUDP("udp4", &net.UDPAddr{IP: addrs[0].addr.AsSlice(), Port: occupied.Port})
+			require.NoError(t, err)
+			require.NoError(t, probe.Close())
+		})
+	}
 }

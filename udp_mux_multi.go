@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/pion/ice/v4/internal/netutil"
 	"github.com/pion/logging"
 	"github.com/pion/transport/v5"
 	"github.com/pion/transport/v5/stdnet"
@@ -79,6 +80,8 @@ func (m *MultiUDPMuxDefault) GetListenAddresses() []net.Addr {
 
 // NewMultiUDPMuxFromPort creates an instance of MultiUDPMuxDefault that
 // listen all interfaces on the provided port.
+// Port zero makes at most 16 attempts to find a common OS-selected port when
+// a later local address has that port in use.
 func NewMultiUDPMuxFromPort(port int, opts ...UDPMuxFromPortOption) (*MultiUDPMuxDefault, error) { //nolint:cyclop
 	params := multiUDPMuxFromPortParam{
 		networks:   []NetworkType{NetworkTypeUDP4, NetworkTypeUDP6},
@@ -100,46 +103,53 @@ func NewMultiUDPMuxFromPort(port int, opts ...UDPMuxFromPortOption) (*MultiUDPMu
 		return nil, err
 	}
 
-	conns := make([]net.PacketConn, 0, len(addrs))
-	for _, addr := range addrs {
-		conn, listenErr := params.net.ListenUDP("udp", &net.UDPAddr{
-			IP:   addr.addr.AsSlice(),
-			Port: port,
-			Zone: addr.addr.Zone(),
-		})
-		if listenErr != nil {
-			err = listenErr
+	const maxBindAttempts = 16
+	conns := make([]transport.UDPConn, 0, len(addrs))
+	for attempt := 1; ; attempt++ {
+		listenPort := port
+		var bindErr error
+		for _, addr := range addrs {
+			conn, listenErr := params.net.ListenUDP("udp", &net.UDPAddr{
+				IP:   addr.addr.AsSlice(),
+				Port: listenPort,
+				Zone: addr.addr.Zone(),
+			})
+			if listenErr != nil {
+				bindErr = listenErr
 
+				break
+			}
+			conns = append(conns, conn)
+			if listenPort == 0 {
+				localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+				if !ok {
+					bindErr = errInvalidAddress
+
+					break
+				}
+				listenPort = localAddr.Port
+			}
+		}
+		if bindErr == nil {
 			break
 		}
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+		if port != 0 || len(conns) == 0 || !netutil.IsAddrInUse(bindErr) || attempt == maxBindAttempts {
+			return nil, bindErr
+		}
+		conns = conns[:0]
+	}
+
+	muxes := make([]UDPMux, 0, len(conns))
+	for _, conn := range conns {
 		if params.readBufferSize > 0 {
 			_ = conn.SetReadBuffer(params.readBufferSize)
 		}
 		if params.writeBufferSize > 0 {
 			_ = conn.SetWriteBuffer(params.writeBufferSize)
 		}
-		conns = append(conns, conn)
-		if port == 0 {
-			localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
-			if !ok {
-				err = errInvalidAddress
-
-				break
-			}
-			port = localAddr.Port
-		}
-	}
-
-	if err != nil {
-		for _, conn := range conns {
-			_ = conn.Close()
-		}
-
-		return nil, err
-	}
-
-	muxes := make([]UDPMux, 0, len(conns))
-	for _, conn := range conns {
 		mux := params.muxFactory(UDPMuxParams{
 			Logger:  params.logger,
 			UDPConn: conn,
